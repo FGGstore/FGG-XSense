@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="FGG-XSense" width="820">
+</p>
+
 # FGG-XSense
 
 **Use an Xbox controller on a jailbroken PlayStation 5.**
