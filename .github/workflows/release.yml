@@ -1,0 +1,103 @@
+name: Release
+
+# Tag a version and the payload is built and published automatically, so the
+# thing people actually want -- fgg-xsense.elf -- is one click from the
+# releases page and nobody has to install a cross-compiler to get it.
+on:
+  push:
+    # Both spellings: 'v0.1' and a bare '0.1'. Matching only 'v*' silently does
+    # nothing for a tag like 0.1, and the release then shows just GitHub's
+    # automatic source archives with no payload attached.
+    tags:
+      - 'v[0-9]*'
+      - '[0-9]*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and attach the payload to (e.g. 0.1)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and publish payload
+    runs-on: ubuntu-latest
+
+    steps:
+      # For a manual run the tag has to be named explicitly, or checkout takes
+      # the default branch and would publish whatever is on main rather than
+      # what the tag points at.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm make unzip curl
+
+      - name: Install PS5 Payload SDK
+        run: |
+          curl -sSL -o sdk.zip \
+            https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip
+          sudo unzip -q -o -d /opt sdk.zip
+          sudo chmod -R +x /opt/ps5-payload-sdk/bin
+
+      - name: Build
+        run: |
+          export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+          make
+          file fgg-xsense.elf
+
+      # Payload Manager reads this alongside the ELF, so installing from a
+      # release is a copy of two files into /data/pldmgr/payloads/fgg-xsense/.
+      - name: Generate payload metadata
+        run: |
+          VERSION="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          SHA=$(sha256sum fgg-xsense.elf | cut -d' ' -f1)
+          cat > fgg-xsense.elf.json <<META
+          {
+            "name": "FGG-XSense",
+            "filename": "fgg-xsense.elf",
+            "description": "Use an Xbox-protocol controller on a PlayStation 5",
+            "version": "${VERSION}",
+            "checksum": "${SHA}",
+            "category": "Utilities",
+            "source": "https://github.com/FGGstore/FGG-XSense"
+          }
+          META
+          sha256sum fgg-xsense.elf | tee SHA256SUMS
+          cat fgg-xsense.elf.json
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: FGG-XSense ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            fgg-xsense.elf
+            fgg-xsense.elf.json
+            SHA256SUMS
+          body: |
+            ## Install
+
+            **Payload Manager** — copy `fgg-xsense.elf` and `fgg-xsense.elf.json`
+            into `/data/pldmgr/payloads/fgg-xsense/` over FTP, then launch
+            **fgg xsense**.
+
+            **Direct** — send `fgg-xsense.elf` to port 9021 with any payload sender.
+
+            ## Use
+
+            Plug in an Xbox-protocol USB controller and launch the payload. The
+            guide LED lights and the controller works. Hold **View+Menu** for two
+            seconds to stop it, or just unplug the controller.
+
+            The **PS button is not mapped** and cannot be — the system intercepts
+            it above the pad layer. Keep a DualSense for that.
+
+            Verify your download against `SHA256SUMS`.

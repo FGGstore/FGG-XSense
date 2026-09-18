@@ -1,0 +1,30 @@
+# This project is edited on Windows and built on both Windows (MSVC host
+# harness) and Linux (PS5 SDK cross-compile via WSL and CI). Left to itself git
+# would hand Linux a Makefile with CRLF line endings, which make does not
+# tolerate, so normalise everything to LF in the repository.
+
+* text=auto eol=lf
+
+# Sources and scripts: LF, always.
+*.c      text eol=lf
+*.h      text eol=lf
+*.md     text eol=lf
+*.py     text eol=lf
+*.yml    text eol=lf
+*.ini    text eol=lf
+*.txt    text eol=lf
+Makefile* text eol=lf
+
+# PowerShell is only ever run on Windows and is happier with CRLF.
+*.ps1    text eol=crlf
+
+# Anything binary that ever lands here must not be touched.
+*.elf    binary
+*.exe    binary
+*.zip    binary
+*.7z     binary
+*.png    binary
+
+# Vendored code is excluded from language statistics and from diffs, since it
+# is not this project's work and its size would otherwise dominate both.
+third_party/** linguist-vendored

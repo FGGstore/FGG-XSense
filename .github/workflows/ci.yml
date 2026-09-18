@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build payload
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          # llvm is required but is absent from the SDK's documented dependency
+          # list: without llvm-config the wrapper fails with a confusing
+          # "/llvm-clang: No such file or directory".
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm make unzip curl
+
+      - name: Install PS5 Payload SDK
+        run: |
+          curl -sSL -o sdk.zip \
+            https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip
+          sudo unzip -q -o -d /opt sdk.zip
+          sudo chmod -R +x /opt/ps5-payload-sdk/bin
+
+      # Built with -Wall -Wextra -Werror, so a warning fails the build.
+      - name: Build
+        run: |
+          export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+          make
+          file fgg-xsense.elf
