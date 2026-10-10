@@ -111,7 +111,8 @@ tested is still recognised. Nothing that fails to match is opened, configured or
 claimed.
 
 Developed and verified against a GameSir pad (`3537:1010`) on firmware
-**11.60**.
+**11.60**. Also verified with an official Microsoft Xbox Series X|S controller
+(`045E:0B12`) on firmware **13.60** (kstuff lite 1.11).
 
 > Xbox 360 controllers use an older, different protocol and are **not**
 > supported.

@@ -136,13 +136,12 @@ static void run(gip_device *dev, vpad *pad, stats *st)
 
                 st->reports++;
 
+                /* Only the start and end of the hold are seen here: the
+                 * controller reports changes, so a combination held perfectly
+                 * still sends nothing more. How long it has been held is
+                 * checked with the timers below. */
                 if ((buttons & (GIP_VIEW | GIP_MENU)) == (GIP_VIEW | GIP_MENU)) {
-                    if (quit_since == 0) {
-                        quit_since = time(NULL);
-                    } else if (time(NULL) - quit_since >= QUIT_HOLD_SECONDS) {
-                        log_line("  View+Menu held -- stopping");
-                        return;
-                    }
+                    if (quit_since == 0) quit_since = time(NULL);
                 } else {
                     quit_since = 0;
                 }
@@ -156,6 +155,11 @@ static void run(gip_device *dev, vpad *pad, stats *st)
          * arrived. An earlier version skipped it whenever the guide button was
          * pressed, which stalled the heartbeat and every timer below it. */
         now = time(NULL);
+
+        if (quit_since != 0 && now - quit_since >= QUIT_HOLD_SECONDS) {
+            log_line("  View+Menu held -- stopping");
+            return;
+        }
 
         if (now != last_beat) {
             last_beat = now;
