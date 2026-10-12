@@ -12,12 +12,17 @@
 #ifndef FGG_VPAD_H
 #define FGG_VPAD_H
 
+#include "pad.h"
+
 #include <stdint.h>
 
 typedef struct vpad vpad;
 
+/* How many virtual controllers may exist at once. */
+#define VPAD_MAX 8
+
 /* Registers a virtual controller owned by `user`. Returns NULL on failure with
- * a short reason in `why`. */
+ * a short reason in `why`. Each call registers a separate controller. */
 vpad *vpad_open(uint32_t user, char *why, int whylen);
 
 /* Removes the device. A pad left registered outlives the payload. */
@@ -28,7 +33,7 @@ int vpad_handle(const vpad *pad);
 /* Publishes one frame of input, already translated. Returns 0 on failure. */
 int vpad_submit(vpad *pad, const unsigned char *report);
 
-/* Translates a GIP input report into the report the kernel reads.
+/* Translates a controller's state into the report the kernel reads.
  *
  * `report` must be VPAD_REPORT_SIZE bytes. Note that this is emphatically not
  * a ScePadData: libScePad translates its caller's ScePadData into a
@@ -40,6 +45,6 @@ int vpad_submit(vpad *pad, const unsigned char *report);
  */
 #define VPAD_REPORT_SIZE 0xA0
 
-void vpad_translate(const unsigned char *gip_report, unsigned char *report);
+void vpad_translate(const pad_state *state, unsigned char *report);
 
 #endif

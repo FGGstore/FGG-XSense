@@ -3,265 +3,224 @@
  * A PS5 enumerates a GIP gamepad and then ignores it entirely: no light, no
  * input, not even a complaint. This payload picks it up and republishes it to
  * the system as an ordinary PlayStation pad. Nothing in the system software is
- * patched, nothing is installed, and the virtual pad is removed on exit.
+ * patched, nothing is installed, and the virtual pads are removed on exit.
  *
- *   gip.c   reads the controller over USB
- *   vpad.c  publishes a virtual pad to the kernel and translates reports
- *   main.c  the lock, the event loop, and keeping a stalling controller alive
+ *   main.c            the lock, finding controllers, stopping
+ *   pads.c            connected controllers -> one virtual pad each
+ *   vpad.c            publishes a virtual pad to the kernel
+ *   gip/gip_proto.c   the Xbox wire protocol
+ *   gip/gip_wired.c   a controller on a USB cable, one thread each
+ *   usb/ugen.c        USB device nodes and transfer slots
+ *   usb/usb_enum.c    finding devices without two backends sharing one
+ *   dongle/           the Xbox Wireless Adapter (firmware start so far)
  *
- * The PS button is not mapped, and cannot be -- see the note in gip.h and the
- * README. Everything else works.
+ * Resident: it waits for controllers, serves them while connected and waits
+ * again, so it can be autoloaded before one is plugged in. Holding View+Menu
+ * on any controller stops it, as does creating /data/fgg-xsense/stop.
+ *
+ * The PS button cannot be sent through a virtual pad -- see the README.
  */
-#include "gip.h"
+#include "config.h"
+#include "dongle/dongle.h"
+#include "dongle/link.h"
+#include "dongle/mt76_radio.h"
+#include "gip/gip_wired.h"
+#include "lock.h"
 #include "log.h"
-#include "vpad.h"
+#include "pads.h"
+#include "usb/usb_enum.h"
 
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/types.h>
-
-#include <fcntl.h>
-#include <stdint.h>
+#include <pthread.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
 #define STATE_DIR "/data/fgg-xsense"
 #define LOG_PATH  STATE_DIR "/xsense.log"
-#define LOCK_PATH STATE_DIR "/xsense.lock"
+#define LOG_OLD_PATH STATE_DIR "/xsense.old.log"   /* the previous run's */
 
-/* How stale the lock must be before another copy claims it. The running
- * payload refreshes it every second, so anything older belongs to a copy that
- * died without cleaning up. */
-#define LOCK_STALE_SECONDS 15
+/* Creating this file (e.g. over FTP) stops the payload, as View+Menu does. */
+#define STOP_TRIGGER STATE_DIR "/stop"
 
-/* Silence, in seconds, before concluding the controller is really gone.
- *
- * This has to be measured in time rather than in failed reads. Failed reads
- * are entirely normal here, and a failure returns immediately with no wait, so
- * counting them declares an unplug within microseconds of starting.
- */
-#define UNPLUG_SECONDS 30
+/* How often to look for newly connected controllers. */
+#define SCAN_SECONDS 3
 
-/* Silence that triggers re-initialisation instead of giving up. */
-#define REINIT_SECONDS 3
+/* How often the main loop wakes, in microseconds. */
+#define TICK_US 100000
 
-/* Re-initialise this often even while everything is healthy. Waiting for the
- * controller to fall silent first costs a few seconds of input every time. */
-#define KEEPALIVE_SECONDS 20
+/* One thread per connected device. */
+typedef struct {
+    int          active;
+    volatile int done;
+    pthread_t    thread;
+    char         node[USB_NODE_LEN];
+} backend;
 
-/* Consecutive fruitless re-initialisations before rebuilding the USB
- * connection, which is the heavier remedy for a wedged endpoint. */
-#define REINITS_BEFORE_REBUILD 3
+static backend g_backends[PADS_MAX];
 
-/* Hold View+Menu together this long to stop the payload deliberately. Held
- * rather than tapped, so it cannot fire by accident mid-game. */
-#define QUIT_HOLD_SECONDS 2
+/* The wireless adapter's thread. One adapter is supported. */
+static backend g_adapter;
 
-/* How often to summarise progress into the log. */
-#define REPORT_SECONDS 60
-
-/* The user the virtual pad belongs to. */
-#define VPAD_USER 1
-
-/* Refuses to start when another copy is already running.
- *
- * Launching twice is easy to do by accident, and two copies is not merely
- * wasteful: both claim the same USB interface, both queue reads on the same
- * endpoint, and each consumes completions belonging to the other. It presents
- * exactly as failing hardware -- a controller that constantly goes quiet and
- * gets reinitialised -- which took a long time to recognise for what it was.
- */
-static int lock_take(void)
+static void *adapter_thread(void *arg)
 {
-    struct stat stv;
-    int fd;
+    backend *b = arg;
 
-    if (stat(LOCK_PATH, &stv) == 0 &&
-        time(NULL) - stv.st_mtime < LOCK_STALE_SECONDS)
-        return 0;
-
-    fd = open(LOCK_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return 0;
-    close(fd);
-    return 1;
+    dongle_run(b->node);
+    b->done = 1;
+    return NULL;
 }
 
-static void lock_refresh(void) { utimes(LOCK_PATH, NULL); }
-static void lock_release(void) { unlink(LOCK_PATH); }
-
-/* Everything the event loop counts, kept together so the periodic line and the
- * summary at the end cannot drift apart. */
-typedef struct {
-    long reports, delivered, failed, acked;
-    int  reinits, rebuilds;
-} stats;
-
-/* Returns when the controller is unplugged, the quit combination is held, or
- * the connection cannot be recovered. */
-static void run(gip_device *dev, vpad *pad, stats *st)
+static void *wired_thread(void *arg)
 {
-    unsigned char report[VPAD_REPORT_SIZE];
-    time_t last_input, last_reinit, last_keepalive, last_note;
-    time_t last_beat = 0, quit_since = 0;
-    int since_input = 0;
+    backend *b = arg;
 
-    last_input = last_reinit = last_keepalive = last_note = time(NULL);
+    gip_wired_run(b->node);
+    b->done = 1;
+    return NULL;
+}
+
+/* Collects threads whose device has gone, freeing their node and slot. */
+static void reap(void)
+{
+    int i;
+
+    if (g_adapter.active && g_adapter.done) {
+        pthread_join(g_adapter.thread, NULL);
+        usb_disown(g_adapter.node);
+        g_adapter.active = 0;
+    }
+
+    for (i = 0; i < PADS_MAX; i++) {
+        if (g_backends[i].active && g_backends[i].done) {
+            pthread_join(g_backends[i].thread, NULL);
+            usb_disown(g_backends[i].node);
+            g_backends[i].active = 0;
+        }
+    }
+}
+
+/* Starts a thread for every newly connected wired controller. Returns how
+ * many were started. */
+static int scan(void)
+{
+    int i, started = 0;
+
+    for (i = 0; i < PADS_MAX; i++) {
+        backend *b = &g_backends[i];
+
+        if (b->active) continue;
+        if (!usb_find_and_own(gip_wired_match, b->node)) break;
+
+        b->done = 0;
+        if (pthread_create(&b->thread, NULL, wired_thread, b) != 0) {
+            log_line("  %s: could not start a thread", b->node);
+            usb_disown(b->node);
+            break;
+        }
+        b->active = 1;
+        started++;
+    }
+
+    if (!g_adapter.active && usb_find_and_own(dongle_match, g_adapter.node)) {
+        g_adapter.done = 0;
+        if (pthread_create(&g_adapter.thread, NULL, adapter_thread, &g_adapter) == 0)
+            g_adapter.active = 1;
+        else
+            usb_disown(g_adapter.node);
+    }
+
+    return started;
+}
+
+static int any_active(void)
+{
+    int i;
+    for (i = 0; i < PADS_MAX; i++)
+        if (g_backends[i].active) return 1;
+    return 0;
+}
+
+int main(void)
+{
+    time_t last_scan = 0, last_beat = 0;
+    int waiting = 0, i;
+
+    if (!log_open(STATE_DIR, LOG_PATH, LOG_OLD_PATH)) return 1;
+
+    /* The log is started afresh only once the lock is ours: a second copy
+     * must not move the running copy's log out from under it. */
+    if (!lock_take()) {
+        log_line("FGG-XSense: another copy is already running -- exiting");
+        notify("FGG-XSense: already running");
+        log_close();
+        return 1;
+    }
+    log_fresh();
+
+    log_line("========================================");
+    log_line("FGG-XSense -- Xbox controller on PlayStation 5");
+
+    config_load(CONFIG_PATH);
+    pads_set_mirror(config_int("mirror", 0));
+    dongle_set_trace(config_int("trace_mt76", 0));
+    link_set_trace(config_int("trace_gip", 0));
+    link_set_idle_off(config_int("idle_off_minutes", 15));
+    mt76_radio_force_channel(config_int("adapter_channel", 0));
+    if (config_int("mirror", 0))
+        log_line("  mirror=1: every controller is published twice");
+
+    notify("FGG-XSense: waiting for an Xbox controller");
 
     for (;;) {
-        const unsigned char *msg = NULL;
-        time_t now;
-        int n = gip_read(dev, &msg);
-
-        if (n < 0) {
-            /* Back off briefly so a refused transfer does not spin the CPU. */
-            st->failed++;
-            usleep(2000);
-        } else if (n == 0) {
-            usleep(1000);
-        } else if (n >= 4) {
-            last_input = time(NULL);
-            since_input = 0;
-
-            /* Answer anything that asked to be answered before interpreting
-             * it: the controller waits, and eventually stops talking to a host
-             * that ignores it. */
-            if (msg[1] & GIP_OPT_ACK) {
-                gip_acknowledge(dev, msg);
-                st->acked++;
-            }
-
-            if (msg[0] == GIP_LL_INPUT_REPORT && n >= 4 + 14) {
-                unsigned buttons = (unsigned)msg[4] | ((unsigned)msg[5] << 8);
-
-                st->reports++;
-
-                if ((buttons & (GIP_VIEW | GIP_MENU)) == (GIP_VIEW | GIP_MENU)) {
-                    if (quit_since == 0) {
-                        quit_since = time(NULL);
-                    } else if (time(NULL) - quit_since >= QUIT_HOLD_SECONDS) {
-                        log_line("  View+Menu held -- stopping");
-                        return;
-                    }
-                } else {
-                    quit_since = 0;
-                }
-
-                vpad_translate(msg, report);
-                if (vpad_submit(pad, report)) st->delivered++;
-            }
-        }
-
-        /* Housekeeping runs on every pass, including ones where a message
-         * arrived. An earlier version skipped it whenever the guide button was
-         * pressed, which stalled the heartbeat and every timer below it. */
-        now = time(NULL);
+        time_t now = time(NULL);
 
         if (now != last_beat) {
             last_beat = now;
             lock_refresh();
         }
 
-        if (now - last_keepalive >= KEEPALIVE_SECONDS) {
-            last_keepalive = now;
-            gip_init(dev);
+        if (pads_tick(now)) {
+            log_line("  View+Menu held -- stopping");
+            break;
+        }
+        if (access(STOP_TRIGGER, F_OK) == 0) {
+            unlink(STOP_TRIGGER);
+            log_line("  stop file found -- stopping");
+            break;
         }
 
-        if (now - last_input >= REINIT_SECONDS &&
-            now - last_reinit >= REINIT_SECONDS) {
-            last_reinit = last_keepalive = now;
-            st->reinits++;
-            gip_init(dev);
-
-            if (++since_input >= REINITS_BEFORE_REBUILD) {
-                since_input = 0;
-                st->rebuilds++;
-                log_line("  re-initialising is not helping -- rebuilding USB");
-                if (!gip_rebuild(dev)) {
-                    log_line("  rebuild failed -- giving up");
-                    return;
-                }
+        if (now - last_scan >= SCAN_SECONDS) {
+            last_scan = now;
+            reap();
+            if (scan() > 0) {
+                waiting = 0;
+            } else if (!any_active() && !waiting) {
+                log_line("  no Xbox-protocol controller connected -- waiting");
+                waiting = 1;
             }
         }
 
-        if (now - last_input >= UNPLUG_SECONDS) {
-            log_line("  no input for %d seconds -- controller gone",
-                     UNPLUG_SECONDS);
-            return;
-        }
+        usleep(TICK_US);
+    }
 
-        if (now - last_note >= REPORT_SECONDS) {
-            last_note = now;
-            log_line("  %ld read, %ld delivered, %ld acked, %d reinit(s), "
-                     "%d rebuild(s)",
-                     st->reports, st->delivered, st->acked,
-                     st->reinits, st->rebuilds);
+    /* Backends notice the stop within a read or two and remove their pads. */
+    pads_request_stop();
+    for (i = 0; i < PADS_MAX; i++) {
+        if (g_backends[i].active) {
+            pthread_join(g_backends[i].thread, NULL);
+            usb_disown(g_backends[i].node);
+            g_backends[i].active = 0;
         }
     }
-}
 
-int main(void)
-{
-    char why[160];
-    gip_device *dev = NULL;
-    vpad *pad = NULL;
-    stats st;
-    int rc = 1;
-
-    memset(&st, 0, sizeof st);
-
-    if (!log_open(STATE_DIR, LOG_PATH)) return 1;
-
-    log_line("========================================");
-    log_line("FGG-XSense -- Xbox controller on PlayStation 5");
-
-    if (!lock_take()) {
-        log_line("  another copy is already running -- exiting");
-        notify("FGG-XSense: already running");
-        log_close();
-        return 1;
+    if (g_adapter.active) {
+        pthread_join(g_adapter.thread, NULL);
+        usb_disown(g_adapter.node);
+        g_adapter.active = 0;
     }
 
-    dev = gip_open(why, (int)sizeof why);
-    if (!dev) {
-        log_line("  %s", why);
-        notify("FGG-XSense: %s", why);
-        goto done;
-    }
-    log_line("  controller %s  %04X:%04X  %s",
-             gip_node(dev), gip_vendor(dev), gip_product(dev), why);
-
-    pad = vpad_open(VPAD_USER, why, (int)sizeof why);
-    if (!pad) {
-        log_line("  could not register a virtual pad -- %s", why);
-        notify("FGG-XSense: could not register a virtual pad");
-        goto done;
-    }
-    log_line("  virtual pad registered, %s", why);
-
-    notify("FGG-XSense: controller ready - hold View+Menu to stop");
-    log_line("  running -- unplug the controller or hold View+Menu to stop");
-
-    run(dev, pad, &st);
-
-    log_line("  total: %ld read, %ld delivered, %ld failed, %ld acked, "
-             "%d reinit(s), %d rebuild(s)",
-             st.reports, st.delivered, st.failed, st.acked,
-             st.reinits, st.rebuilds);
-
-    if (st.delivered > 0)
-        notify("FGG-XSense: stopped - %ld inputs delivered", st.delivered);
-    else
-        notify("FGG-XSense: no input delivered - see the log");
-
-    rc = 0;
-
-done:
-    /* One exit path, so a pad cannot be left registered and the lock cannot be
-     * left behind by whichever failure happened to occur. */
-    vpad_close(pad);
-    gip_close(dev);
+    notify("FGG-XSense: stopped");
     lock_release();
     log_close();
-    return rc;
+    return 0;
 }

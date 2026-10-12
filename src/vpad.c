@@ -1,5 +1,4 @@
 #include "vpad.h"
-#include "gip.h"
 
 #include <sys/ioctl.h>
 #include <sys/types.h>
@@ -75,17 +74,28 @@ typedef struct {
 } hid_del;
 
 struct vpad {
+    int     used;
     int     fd;
     int32_t handle;
 };
 
-static struct vpad g_pad;
+/* Callers serialise opening and closing (pads.c holds its lock), so the
+ * table needs no lock of its own. */
+static struct vpad g_pads[VPAD_MAX];
 
 vpad *vpad_open(uint32_t user, char *why, int whylen)
 {
     unsigned char desc[VDEV_DESC_SIZE];
-    struct vpad *pad = &g_pad;
+    struct vpad *pad = NULL;
     hid_req req;
+    int i;
+
+    for (i = 0; i < VPAD_MAX && !pad; i++)
+        if (!g_pads[i].used) pad = &g_pads[i];
+    if (!pad) {
+        snprintf(why, (size_t)whylen, "all %d virtual pads in use", VPAD_MAX);
+        return NULL;
+    }
 
     pad->fd = open("/dev/hid", O_RDWR);
     if (pad->fd < 0) {
@@ -112,6 +122,7 @@ vpad *vpad_open(uint32_t user, char *why, int whylen)
         return NULL;
     }
 
+    pad->used = 1;
     snprintf(why, (size_t)whylen, "handle %d", pad->handle);
     return pad;
 }
@@ -141,63 +152,56 @@ void vpad_close(vpad *pad)
 
     close(pad->fd);
     pad->fd = -1;
+    pad->used = 0;
 }
 
 int vpad_handle(const vpad *pad) { return pad->handle; }
 
 /* ---- translation ------------------------------------------------------- */
 
-static int16_t le16(const unsigned char *p)
-{
-    return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
-}
-
-/* GIP sticks are signed 16-bit with Y increasing upwards; PlayStation sticks
+/* pad_state sticks are signed 16-bit with Y increasing upwards; PlayStation sticks
  * are unsigned 8-bit with Y increasing downwards, so Y is inverted here rather
  * than left for every game to be confused by. */
 static uint8_t axis(int16_t v)     { return (uint8_t)(((int)v + 32768) >> 8); }
 static uint8_t axis_inv(int16_t v) { return (uint8_t)((32767 - (int)v) >> 8); }
 
-void vpad_translate(const unsigned char *gip_report, unsigned char *report)
+void vpad_translate(const pad_state *state, unsigned char *report)
 {
-    const unsigned char *d = gip_report + 4;   /* past the message header */
-    unsigned m  = (unsigned)d[0] | ((unsigned)d[1] << 8);
-    unsigned lt = (unsigned)d[2] | ((unsigned)d[3] << 8);
-    unsigned rt = (unsigned)d[4] | ((unsigned)d[5] << 8);
+    uint32_t m = state->buttons;
     uint32_t b = 0;
     float ident = 1.0f;
 
     memset(report, 0, VPAD_REPORT_SIZE);
 
-    if (m & GIP_A)     b |= SCE_CROSS;
-    if (m & GIP_B)     b |= SCE_CIRCLE;
-    if (m & GIP_X)     b |= SCE_SQUARE;
-    if (m & GIP_Y)     b |= SCE_TRIANGLE;
-    if (m & GIP_UP)    b |= SCE_UP;
-    if (m & GIP_DOWN)  b |= SCE_DOWN;
-    if (m & GIP_LEFT)  b |= SCE_LEFT;
-    if (m & GIP_RIGHT) b |= SCE_RIGHT;
-    if (m & GIP_LB)    b |= SCE_L1;
-    if (m & GIP_RB)    b |= SCE_R1;
-    if (m & GIP_LS)    b |= SCE_L3;
-    if (m & GIP_RS)    b |= SCE_R3;
-    if (m & GIP_MENU)  b |= SCE_OPTIONS;
-    if (m & GIP_VIEW)  b |= SCE_TOUCHPAD;
+    if (m & PAD_A)     b |= SCE_CROSS;
+    if (m & PAD_B)     b |= SCE_CIRCLE;
+    if (m & PAD_X)     b |= SCE_SQUARE;
+    if (m & PAD_Y)     b |= SCE_TRIANGLE;
+    if (m & PAD_UP)    b |= SCE_UP;
+    if (m & PAD_DOWN)  b |= SCE_DOWN;
+    if (m & PAD_LEFT)  b |= SCE_LEFT;
+    if (m & PAD_RIGHT) b |= SCE_RIGHT;
+    if (m & PAD_LB)    b |= SCE_L1;
+    if (m & PAD_RB)    b |= SCE_R1;
+    if (m & PAD_LS)    b |= SCE_L3;
+    if (m & PAD_RS)    b |= SCE_R3;
+    if (m & PAD_MENU)  b |= SCE_OPTIONS;
+    if (m & PAD_VIEW)  b |= SCE_TOUCHPAD;
 
     /* The triggers are analogue on both sides, but PlayStation also expects a
      * digital bit once they are meaningfully pressed. */
-    if (lt > TRIGGER_DIGITAL) b |= SCE_L2;
-    if (rt > TRIGGER_DIGITAL) b |= SCE_R2;
+    if (state->lt > TRIGGER_DIGITAL) b |= SCE_L2;
+    if (state->rt > TRIGGER_DIGITAL) b |= SCE_R2;
 
     memcpy(report + VP_BUTTONS, &b, sizeof b);
 
-    report[VP_STICKS + 0] = axis(le16(d + 6));
-    report[VP_STICKS + 1] = axis_inv(le16(d + 8));
-    report[VP_STICKS + 2] = axis(le16(d + 10));
-    report[VP_STICKS + 3] = axis_inv(le16(d + 12));
+    report[VP_STICKS + 0] = axis(state->lx);
+    report[VP_STICKS + 1] = axis_inv(state->ly);
+    report[VP_STICKS + 2] = axis(state->rx);
+    report[VP_STICKS + 3] = axis_inv(state->ry);
 
-    report[VP_L2] = (uint8_t)(lt >> 2);
-    report[VP_R2] = (uint8_t)(rt >> 2);
+    report[VP_L2] = (uint8_t)(state->lt >> 2);
+    report[VP_R2] = (uint8_t)(state->rt >> 2);
     report[VP_ACTIVE] = 1;
 
     /* Identity quaternion, so the motion block is at least well formed. */

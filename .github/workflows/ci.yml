@@ -35,3 +35,9 @@ jobs:
           export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
           make
           file fgg-xsense.elf
+
+      # Host-side tests of everything that touches no device.
+      - name: Test
+        run: |
+          export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+          make check
